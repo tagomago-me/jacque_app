@@ -161,13 +161,22 @@ struct SerieSheet: View {
     }
 }
 
-struct Fala: Identifiable { let id = UUID(); let minha: Bool; let texto: String }
+struct Fala: Identifiable {
+    let id = UUID()
+    let minha: Bool
+    var texto: String
+    var cid: String? = nil      // id do cliente: o servidor ignora o mesmo cid, então reenviar nunca grava duas vezes
+    var falhou = false          // a mensagem não chegou ao servidor (nada foi gravado)
+}
+struct RespEnvio: Decodable { let ok: Bool?; let id: String?; let erro: String? }
+struct RespPronta: Decodable { let pronto: Bool?; let resposta: String?; let erro: String? }
 
 /// Conversa com a Jacque pelo app, na sessão do treino aberto (ou na sessão do app, fora do treino).
+/// O envio só enfileira; a resposta vem por consulta. Demora ou queda de rede não vira "Falhou" se a mensagem já chegou.
 struct ConversaView: View {
     @State private var falas: [Fala] = []
     @State private var texto = ""
-    @State private var esperando = false
+    @State private var pendentes = 0
 
     var body: some View {
         NavigationStack {
@@ -176,21 +185,31 @@ struct ConversaView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 10) {
                             ForEach(falas) { f in
-                                Text(f.texto)
-                                    .padding(10)
-                                    .background(f.minha ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
-                                    .frame(maxWidth: .infinity, alignment: f.minha ? .trailing : .leading)
-                                    .id(f.id)
+                                VStack(alignment: f.minha ? .trailing : .leading, spacing: 4) {
+                                    Text(f.texto)
+                                        .textSelection(.enabled)
+                                        .padding(10)
+                                        .background(f.minha ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+                                        .contextMenu { Button("Copiar") { UIPasteboard.general.string = f.texto } }
+                                    if f.falhou {
+                                        HStack(spacing: 8) {
+                                            Text("Não enviado").font(.caption).foregroundStyle(.red)
+                                            Button("Reenviar") { Task { await despachar(f.id) } }.font(.caption.bold())
+                                        }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: f.minha ? .trailing : .leading)
+                                .id(f.id)
                             }
-                            if esperando { ProgressView().frame(maxWidth: .infinity, alignment: .leading) }
+                            if pendentes > 0 { ProgressView().frame(maxWidth: .infinity, alignment: .leading) }
                         }.padding()
                     }
                     .onChange(of: falas.count) { if let u = falas.last { withAnimation { sv.scrollTo(u.id, anchor: .bottom) } } }
                 }
                 HStack {
                     TextField("Fala com a Jacque", text: $texto, axis: .vertical).textFieldStyle(.roundedBorder).lineLimit(1...4)
-                    Button { Task { await enviar() } } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                        .disabled(esperando || texto.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button { enviar() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
+                        .disabled(texto.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }.padding()
             }
             .navigationTitle("Jacque")
@@ -198,13 +217,46 @@ struct ConversaView: View {
         }
     }
 
-    private func enviar() async {
+    private func enviar() {
         let msg = texto.trimmingCharacters(in: .whitespacesAndNewlines)
-        texto = ""; falas.append(Fala(minha: true, texto: msg)); esperando = true
-        defer { esperando = false }
-        do {
-            let r: RespChat = try await Gateway.post("/jacque/treino/chat", ["texto": msg], timeout: 170)
-            falas.append(Fala(minha: false, texto: r.resposta ?? r.erro ?? "Sem resposta."))
-        } catch { falas.append(Fala(minha: false, texto: "Falhou: " + error.localizedDescription)) }
+        guard !msg.isEmpty else { return }
+        texto = ""
+        let f = Fala(minha: true, texto: msg, cid: UUID().uuidString)
+        falas.append(f)
+        Task { await despachar(f.id) }
+    }
+
+    private func marcar(_ fid: UUID, falhou: Bool) {
+        if let i = falas.firstIndex(where: { $0.id == fid }) { falas[i].falhou = falhou }
+    }
+
+    private func despachar(_ fid: UUID) async {
+        guard let i = falas.firstIndex(where: { $0.id == fid }), let cid = falas[i].cid else { return }
+        let msg = falas[i].texto
+        marcar(fid, falhou: false)
+        pendentes += 1
+        defer { pendentes -= 1 }
+        var id: String?
+        for _ in 0..<3 {   // reenvio automático é seguro: o servidor ignora o mesmo cid
+            do {
+                let r: RespEnvio = try await Gateway.post("/jacque/treino/chat", ["texto": msg, "cid": cid], timeout: 20)
+                if let e = r.erro { falas.append(Fala(minha: false, texto: e)); marcar(fid, falhou: true); return }
+                id = r.id
+                break
+            } catch { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+        }
+        guard let id else { marcar(fid, falhou: true); return }
+        let fim = Date().addingTimeInterval(240)
+        while Date() < fim {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            do {
+                let r: RespPronta = try await Gateway.get("/jacque/treino/resposta", [URLQueryItem(name: "id", value: id)])
+                if r.pronto == true { falas.append(Fala(minha: false, texto: r.resposta ?? r.erro ?? "Sem resposta.")); return }
+            } catch GatewayErro.http(let c, _) where c == 400 {
+                falas.append(Fala(minha: false, texto: "A resposta expirou. Se foi uma série, ela já está gravada: veja em Treino."))
+                return
+            } catch { /* rede caiu: tenta de novo */ }
+        }
+        falas.append(Fala(minha: false, texto: "A Jacque ainda não respondeu. Se foi uma série, ela já está gravada: veja em Treino."))
     }
 }
